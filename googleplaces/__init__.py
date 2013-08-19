@@ -14,17 +14,19 @@ production environment.
 """
 
 import cgi
+from google.appengine.api import urlfetch
+
 try:
     import json
 except ImportError:
     import simplejson as json
 import urllib
-import urllib2
 import warnings
 
 import lang
 import ranking
 import types
+import logging
 
 
 __all__ = ['GooglePlaces', 'GooglePlacesError', 'GooglePlacesAttributeError',
@@ -50,29 +52,41 @@ def _fetch_remote(service_url, params={}, use_http_post=False):
         query_url = (service_url if service_url.endswith('?') else
                      '%s?' % service_url)
         request_url = query_url + encoded_data
-        request = urllib2.Request(request_url)
+        args = (request_url)
     else:
         request_url = service_url
-        request = urllib2.Request(service_url, data=encoded_data)
-    return (request_url, urllib2.urlopen(request))
+        args = (request_url, encoded_data, urlfetch.POST)
+
+    try:
+        response = urlfetch.fetch(args, deadline=15)
+    except urlfetch.DeadlineExceededError as error:
+        logging.error('Failed to fetch Places API content:\n%s: %s' % (error.__class__, error.message))
+    return (request_url, response)
+
 
 def _fetch_remote_json(service_url, params={}, use_http_post=False):
     """Retrieves a JSON object from a URL."""
     request_url, response = _fetch_remote(service_url, params, use_http_post)
-    return (request_url, json.load(response))
+    # logging.info('Google Places result: %s' % response.content)
+    return (request_url, json.loads(response.content))
+
 
 def _fetch_remote_file(service_url, params={}, use_http_post=False):
     """Retrieves a file from a URL.
 
-    Returns a tuple (mimetype, filename, data)
+    Returns a tuple (mimetype, filename, data, url)
     """
     request_url, response = _fetch_remote(service_url, params, use_http_post)
     dummy, params = cgi.parse_header(
-            response.headers.get('Content-Disposition', ''))
-    fn = params['filename']
+        response.headers.get('Content-Disposition', ''))
+    try:
+        fn = params['filename']
+    except KeyError:
+        fn = 'default'
 
     return (response.headers.get('content-type'),
-            fn, response.read(), response.geturl())
+            fn, response.content, response.final_url)
+
 
 def geocode_location(location, sensor=False):
     """Converts a human-readable location to lat-lng.
@@ -98,6 +112,7 @@ def geocode_location(location, sensor=False):
         raise GooglePlacesError, error_detail
     return geo_response['results'][0]['geometry']['location']
 
+
 def _get_place_details(reference, api_key, sensor=False):
     """Gets a detailed place response.
 
@@ -110,6 +125,7 @@ def _get_place_details(reference, api_key, sensor=False):
                                                'key': api_key})
     _validate_response(url, detail_response)
     return detail_response['result']
+
 
 def _get_place_photo(photoreference, api_key, maxheight=None, maxwidth=None,
                        sensor=False):
@@ -138,6 +154,7 @@ def _get_place_photo(photoreference, api_key, maxheight=None, maxwidth=None,
         params['maxwidth'] = maxwidth
 
     return _fetch_remote_file(GooglePlaces.PHOTO_API_URL, params)
+
 
 def _validate_response(url, response):
     """Validates that the response from Google was successful."""
@@ -196,6 +213,7 @@ class GooglePlaces(object):
         self._api_key = api_key
         self._sensor = False
         self._request_params = None
+        self._next_page_token = None
 
     def query(self, **kwargs):
         with warnings.catch_warnings():
@@ -205,8 +223,8 @@ class GooglePlaces(object):
         return self.nearby_search(**kwargs)
 
     def nearby_search(self, language=lang.ENGLISH, keyword=None, location=None,
-               lat_lng=None, name=None, radius=3200, rankby=ranking.PROMINENCE,
-               sensor=False, types=[]):
+                      lat_lng=None, name=None, radius=3200, rankby=ranking.PROMINENCE,
+                      sensor=False, types=[], opennow=False, next_page_token=None):
         """Perform a nearby search using the Google Places API.
 
         One of either location or lat_lng are required, the rest of the keyword
@@ -234,33 +252,44 @@ class GooglePlaces(object):
                     device using a location sensor (default False).
         types    -- An optional list of types, restricting the results to
                     Places (default []).
+        opennow  -- An optional boolean indicating whether places should be
+                    filtered on whether they are open or not (default False).
+        next_page_token -- If specified, all other parameters are ignored and
+                    the next page of results is retrieved.
         """
-        if location is None and lat_lng is None:
-            raise ValueError('One of location or lat_lng must be passed in.')
-        if rankby == 'distance':
-            if keyword is None and types == []:
-                raise ValueError('When rankby = googleplaces.ranking.DISTANCE, ' +
-                                 'one of either the keyword or types kwargs ' +
-                                 'must be specified.')
-        self._sensor = sensor
-        self._lat_lng = (lat_lng if lat_lng is not None
-                         else geocode_location(location))
-        radius = (radius if radius <= GooglePlaces.MAXIMUM_SEARCH_RADIUS
-                  else GooglePlaces.MAXIMUM_SEARCH_RADIUS)
-        lat_lng_str = '%(lat)s,%(lng)s' % self._lat_lng
-        self._request_params = {'location': lat_lng_str}
-        if rankby == 'prominence':
-            self._request_params['radius'] = radius
+        if next_page_token is None:
+            if location is None and lat_lng is None:
+                raise ValueError('One of location or lat_lng must be passed in.')
+            if rankby == 'distance':
+                if keyword is None and types == []:
+                    raise ValueError('When rankby = googleplaces.ranking.DISTANCE, ' +
+                                     'one of either the keyword or types kwargs ' +
+                                     'must be specified.')
+            self._sensor = sensor
+            self._lat_lng = (lat_lng if lat_lng is not None
+                             else geocode_location(location))
+            radius = (radius if radius <= GooglePlaces.MAXIMUM_SEARCH_RADIUS
+                      else GooglePlaces.MAXIMUM_SEARCH_RADIUS)
+            lat_lng_str = '%(lat)s,%(lng)s' % self._lat_lng
+            self._request_params = {'location': lat_lng_str}
+            if rankby == 'prominence':
+                self._request_params['radius'] = radius
+            else:
+                self._request_params['rankby'] = rankby
+            if len(types) > 0:
+                self._request_params['types'] = '|'.join(types)
+            if keyword is not None and keyword is not "":
+                self._request_params['keyword'] = keyword
+            if name is not None:
+                self._request_params['name'] = name
+            if language is not None:
+                self._request_params['language'] = language
+            if opennow:
+                self._request_params['opennow'] = True
         else:
-            self._request_params['rankby'] = rankby
-        if len(types) > 0:
-            self._request_params['types'] = '|'.join(types)
-        if keyword is not None:
-            self._request_params['keyword'] = keyword
-        if name is not None:
-            self._request_params['name'] = name
-        if language is not None:
-            self._request_params['language'] = language
+            self._next_page_token = next_page_token
+            self._request_params = {'pagetoken': self._next_page_token}
+
         self._add_required_param_keys()
         url, places_response = _fetch_remote_json(
                 GooglePlaces.NEARBY_SEARCH_API_URL, self._request_params)
@@ -437,6 +466,7 @@ class GooglePlacesSearchResult(object):
         for place in response['results']:
             self._places.append(Place(query_instance, place))
         self._html_attributions = response.get('html_attributions', [])
+        self._next_page_key = response.get('next_page_token', "")
 
     @property
     def places(self):
@@ -457,11 +487,20 @@ class GooglePlacesSearchResult(object):
         """Returns a flag denoting if the response had any html attributions."""
         return len(self.html_attributions) > 0
 
+    @property
+    def next_page_key(self):
+        """Returns the next_page_token
+
+        If there are more than 20 results this will not be an empty string
+        """
+        return self._next_page_key
+
 
 class Place(object):
     """
     Represents a place from the results of a Google Places API query.
     """
+
     def __init__(self, query_instance, place_data):
         self._query_instance = query_instance
         self._id = place_data['id']
